@@ -1,0 +1,494 @@
+---
+title: "Order Drops"
+author: "Brandt Cowan"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    toc: true
+    keep_md: true
+---
+#Summary
+To understand how changes to order drops induced by E-Commerce business, this analysis seeks to break down potential drivers and trends, and provide insight for future changes. 
+
+#Data 
+##Packages used
+```{r message= FALSE}
+library(readr)    #importing data
+library(readxl)   #importing data
+library(dplyr)    #data wrangling
+library(tidyr)    #data tidying
+library(lubridate)#data formatting for dates
+library(forcats)  #data formatting for factors
+library(psych)    #for use of the describeBy() function
+library(ggplot2)  #data visualization
+library(ggthemes) #for use of the fivethirtyeight theme
+library(viridis)  #for use of the viridis color scheme
+```
+This analysis will work within the tidyverse, almost exlusively using packages based on the tidy concept.
+
+##Data Source
+This analysis is comprised of data from 2 sources.
+
+1. Millipore provided data via *Sameday Lines* analysis provided by Tim Donoghue
+
+2. DHL Supply Chain WMS (*Red Prairie*) sourced data
+
+For the sake of a short report, This report will start with pre-cleaned and wrangled data, and will mostly focus
+on the thought process of sorting through the data instead of providing exact methods behind the data preparation. As Data was collected over time, significant changes occured. Important dates are as follows:
+
+1. **September 12, 2016** : First day of E-Commerce drops, same day drop cutoff pushed back to 1pm.
+2. **October 24, 2016** :First day of 3pm cutoff for E-Commerce and same day drop.
+3. **January 23,2017**: Current proposed change to 4pm cutoff.
+4. **February 21,2017**: Current proposed change to 5pm cutoff.
+
+Where relevant, these dates will be noted on graphs with vertical black lines.
+Hours will always be listed in 24hr format, i.e. 2pm = 14, 3pm =15
+
+
+#Exploratory Analysis
+As changes began occuring to drop times, the first step was to attempt to understand drop patterns, so we could then begin to understand what to expect in future drops. The next step was to seek patterns in orders, and see if there was any way to be proactive, or take advantage of the data to ease the pain caused by the sudden change.
+
+##Drop Timing
+
+To understand impact of the new drop timings on overall business flow, we begin by looking at lines dropped same day vs lines dropped previous day. Based on rigorous analysis by Terry Jones, we know that most of 2016, next day volume could be projected using the formula described below where $P$ = Projected Lines and $V$ = visible lines.
+
+$P = 912.9935+(0.915584 * V)$
+
+This linear regression formula reduced noise on projected volumes to the point where most of the variance could be explained by what day of the week it was, and how many lines came through via backorder vs average. The typical benchmark was that 55% of our next day lines were visible the day before.
+
+```{r echo =FALSE}
+tdrops <- read_excel("~/R/OrderPatterns/90daydrop1.3.2017.xlsx")
+#rename columns
+tdrops<-tdrops %>% rename(lines=`COUNT(DISTINCTSL.SHIP_LINE_ID)`,Time=`Drop Time`) %>% select(-`Day of Week`)
+
+#remove anything after 17:00
+tdrops<-tdrops %>% filter(Time<="17")
+
+#create buckets for same day or prev day drops
+tdrops<-tdrops %>%
+  mutate(sameday = ifelse(`Shipped Date`==`Drop Date`| shpdte == `Drop Date`,"SameDay",
+                    ifelse(`Shipped Date`!=`Drop Date`& shpdte != `Drop Date`, "PrevDay", NA)))
+
+#remove NAs and anything from 1/3/17
+tdrops<-tdrops %>% filter(`Drop Date`!= "01/03/17") %>% filter(shpdte!= "01/03/17") %>% 
+  filter(`Shipped Date`!= "01/03/17") %>% filter(sameday!= "NA") %>% filter(`Shipped Date`!="NA")
+
+tdrops<- tdrops %>% rename(dropdate=`Drop Date`, shipdate=`Shipped Date`)
+tdrops$dropdate<-mdy(tdrops$dropdate)
+tdrops$shipdate<-mdy(tdrops$shipdate)
+
+
+#looks like data is only good going by 60 days
+tdrops<-tdrops %>% filter(shipdate>="2016-11-05")
+dueday<-tdrops %>% group_by(sameday,shipdate) %>% summarise(Lines=sum(lines))
+```
+
+
+```{r echo =FALSE}
+dueday %>% group_by(sameday) %>% summarise(Lines=sum(Lines)) %>% 
+ggplot(aes(y=Lines, x=sameday,fill=sameday, position="dodge"))+geom_bar(stat="identity", fill=c("purple","turquoise")) +theme_fivethirtyeight()+ggtitle("Total lines by Drop Day", subtitle = "Nov 11-Dec 30, 36 business days observed")+geom_text(aes(label=Lines), vjust=1.1, color ="white", fontface="bold", size =10)
+
+```
+
+Here we can clearly see in the 36 business days observed that significant portion of the lines dropped for shipment were dropped on the same day they were due to ship. Of the `r as.character(sum((dueday  %>% summarise(Lines=sum(Lines)))[,2]))` lines due for shipment in that time frame, `r as.character((dueday %>% filter(sameday =="SameDay") %>% summarise(Lines=sum(Lines)))[,2])` were dropped the day they were due to ship. Over this time frame, approx. `r paste0(round((dueday %>% group_by(sameday) %>% summarise(sum= sum(Lines)) %>% mutate(perc= sum/sum(sum)) %>% filter(sameday=="SameDay"))[,3],3)*100,"%")` of our work was dropping the same day it was due to ship, equating to a `r paste0(((round((dueday %>% group_by(sameday) %>% summarise(sum= sum(Lines)) %>% mutate(perc= sum/sum(sum)) %>% filter(sameday=="SameDay"))[,3],3)*100)-45),"%")` shift in visibility. I will discuss further how the *time* in which the lines dropped shifted, that has even more of an impact than this swing.
+
+To ensure that those aggregated numbers aren't heavily influenced by a few days,we can break out the data over time to see how each day behaves.
+
+```{r echo = FALSE,fig.width=10}
+dueday1<- spread(dueday,sameday, Lines) %>% mutate(total=PrevDay + SameDay) %>% mutate(perc= paste0(round(SameDay/total,2)*100,"%"))
+ggplot(dueday,aes(y=Lines,x=shipdate,fill=sameday))+
+  geom_bar(stat="identity",position="stack",col="black")+ggtitle("Total lines by Drop Day", subtitle="Nov 11-Dec 30, With % of Same Day Lines" )+theme_fivethirtyeight()+scale_fill_manual(values=c("purple","turquoise"))+geom_text(inherit.aes = FALSE, data = dueday1,aes(shipdate,total, label=perc), hjust=1,size=4, angle=90, col="white",fontface="bold")
+```
+
+By making each day show as a filled bar, we can quickly observe how each day looks as a percentage of same day vs previous day drops, and quickly determine that the trend holds of now having significantly more lines dropped same day. To double check the perception of fill, I added a % notation. In the chart, only 2 days had previous day drops of more lines than same day drops.
+
+```{r echo = FALSE, results='hide'}
+#ggplot(dueday,aes(y=Lines,x=shipdate,group=sameday, fill=sameday))+geom_bar(stat="identity",position="dodge")+ggtitle("Total lines by Drop Day", subtitle = "With % of Same Day Lines")+scale_fill_manual(values=c("purple","turquoise"))+geom_text(inherit.aes = FALSE, data = dueday1,aes(shipdate,SameDay, label=perc),size=4, vjust=-.5, col="black",fontface="bold")+theme_fivethirtyeight()
+```
+
+Now I will begin to explore hourly drops on the same day level, to understand the impact of changes made.Here, I've plotted drops occuring after 8am, which is when we typically start seeing orders entered same day, over time. We can clearly see a trend of larger line amounts being dropped later in the day. 
+```{r echo= FALSE , message = FALSE}
+drops<- read_csv("~/R/OrderPatterns/90DayLinesDropped.csv")
+#fix columns, dates, Weekday as factor
+drops<-drops %>% rename(lines=`COUNT(DISTINCTSL.SHIP_LINE_ID)`, Weekday=`Day of Week`,Time=`Drop Time`)
+drops$Day<-mdy(drops$Day)
+drops$Weekday<-weekdays(drops$Day)
+day_levels<-c("Monday","Tuesday","Wednesday","Thursday","Friday")
+drops$Weekday<-factor(drops$Weekday,day_levels)
+#split data based on change
+
+onedrops<-drops %>% filter(Day>="2016-09-12") %>% filter(Day<"2016-10-24")
+predrops<-drops %>% filter(Day<="2016-09-11")
+threedrops<-drops %>% filter(Day>="2016-10-24")
+```
+
+This bubble/heatmap is probably my favorite visualization of the changes in drops. The black lines represent the drop changes as noted earlier, and the change in drops is visibly shifting up and right as the changes occur. Updated versions of this plot will appear later as additional data is added. 
+
+```{r echo =FALSE,message = FALSE}
+drops %>% filter(Time>="08") %>%  ggplot(aes(x=Day,y=Time, size=lines,col=lines))+geom_point()+scale_color_viridis()+theme_fivethirtyeight()+
+  geom_vline(xintercept= as.numeric(drops$Day[205])-1)+
+  geom_vline(xintercept= as.numeric(drops$Day[577])-1)+
+  ggtitle("Lines Per Hour Dropped",subtitle="Aug 18-Nov 16, with drop changes marked")
+
+```
+
+Now that we have seen the interaction over time, we can try to explore trends at a weekly level. Do days of the week behave differently? We will explore this by breaking down into 2 timeframes: 1pm cutoff & 3pm cutoff.
+
+```{r echo=FALSE, warning= FALSE, message = FALSE}
+hourlyDOW1<-drops%>% filter(Day >="2016-09-12", Day<="2016-10-23")%>% group_by(Weekday,Time)%>%summarise(Lines=mean(lines)) %>% arrange(desc(Weekday)) %>% filter(Time>="08")
+ggplot(hourlyDOW1, aes(x=Time,y=Weekday))+geom_tile(aes(fill=Lines))+scale_fill_viridis()+ggtitle("1pm Cutoff time frame", subtitle="Average Lines Dropped/Hour")+theme_fivethirtyeight()
+
+
+```
+
+```{r echo=FALSE, warning= FALSE, message = FALSE}
+hourlyDOW2<-drops%>% filter(Day >="2016-10-23") %>% group_by(Weekday,Time)%>%summarise(Lines=mean(lines)) %>% arrange(desc(Weekday)) %>% filter(Time>="08")
+ggplot(hourlyDOW2, aes(x=Time,y=Weekday))+geom_tile(aes(fill=Lines))+scale_fill_viridis()+ggtitle("3pm Cutoff time frame", subtitle="Average Lines Dropped/Hour")+theme_fivethirtyeight()
+
+
+```
+
+
+Now we can explore the change in hourly drops a little more in detail, in relation to how we can expect each hour to behave. By understanding hourly behavior, we can begin to plan labor needs. Averages can be a bit misleading due to outliers skewing the mean. Additionally, understanding variance is important. an hour where we have an average of 50 lines, with a standard deviation of 10, is easy to plan for. An hour where we have an average of 50 lines, with a standard deviation of 50, is very hard to plan for. Along with the standard boxplot, I have included a black dot to indicate the mean, with bars to indicate standard error. These combined give insight to the amount of variance per each hourly drop. The larger the variance, the harder to plan.
+
+
+```{r echo=FALSE, message = FALSE}
+p<-ggplot(data=predrops, aes(x=Time, y=lines,group = Time))+geom_boxplot(col="purple",fill="turquoise")+stat_summary()+theme_fivethirtyeight()
+o<-ggplot(data=onedrops, aes(x=Time, y=lines,group = Time))+geom_boxplot(col="purple",fill="turquoise")+stat_summary()+theme_fivethirtyeight()
+t<-ggplot(data=threedrops, aes(x=Time, y=lines,group = Time))+geom_boxplot(col="purple",fill="turquoise")+stat_summary()+theme_fivethirtyeight()
+
+
+```
+```{r echo= FALSE, message=FALSE, warning = FALSE}
+p+ggtitle("Drops Before E-Com",subtitle="Aug 18 - Sept 11")
+```
+```{r echo= FALSE, message=FALSE, warning = FALSE}
+o+ggtitle("E-Com cutoff 1pm",subtitle="Sept 12 - Oct 23")
+```
+```{r echo= FALSE, message=FALSE, warning = FALSE}
+t+ggtitle("E-Com cutoff 3pm",subtitle="Oct 24 - Nov 15")
+```
+
+As you can see, both changes to the cutoff time made a significant impact to other drops. The behavior I'm most concerned with is the change from 1pm to 3pm, where we see a clear shift in lines dropped at the 1pm hour, suggesting that we could be seeing a change in *behavior* from individuals entering orders. We also see a decrease in early morning drops, which could be a result of orders that would traditionally sit in the cue for release in the morning drops being entered for same day shipment. These plots in conjunction with the same day vs previous day graphs earlier depict a serious change in business flow, which could implicate added labor costs. When less work is available early in the day, labor will be more inefficient. As drops move closer to shipment cutoff, which is currently 7pm, potential issues present a greater threat to impact on time shipping.
+
+
+
+Taking numbers from Tim's previously mentioned Same Day analysis, I noticed a discrepancy in total lines per day listed as saemday lines. Plotted below for comparison, after further digging, it is primarily due to his analysis filtering out air shipments. For my analysis, I have kept these in, since they have a significant impact on total lines. 
+```{r echo=FALSE, message = FALSE, warning=FALSE}
+compare <- read_csv("~/R/OrderPatterns/compare.csv", 
+    col_types = cols(Day = col_character(), 
+        X1 = col_skip()))
+compare$Day<-ymd(compare$Day)
+
+f<-ggplot(compare)+geom_line(aes(Day,lines),col="red", size=1)+
+  geom_point(aes(Day,lines),col="yellow", size=2)+
+  geom_point(aes(Day,Lines),col="turquoise", size=2)+
+  geom_line(aes(Day,Lines),col="purple", size =1)+theme_fivethirtyeight()+ggtitle("Comparing 'sameday' numbers Oct 6th-Nov 16")+geom_vline(xintercept= as.numeric(compare$Day[12]))
+library(plotly)
+ggplotly(f)
+```
+
+Just looking at my data, we see some interesting trends over that time.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+combined <- read_csv("~/R/OrderPatterns/partcustanalysis.csv", 
+    col_types = cols(Booked = col_character(), 
+        BookedTime = col_character(), ReleaseTime = col_character()))
+
+combined<-combined %>% select(-1)
+combined$SHIP_ID<-factor(combined$SHIP_ID)
+combined$priority<-factor(combined$priority)
+combined$CARCOD<-factor(combined$CARCOD)
+combined$ADRNAM<-factor(combined$ADRNAM)
+combined$DOW<-factor(weekdays(combined$Day),day_levels)
+combined$Btime<- paste(combined$Booked, combined$BookedTime)
+combined$Rtime<- paste(combined$Booked, combined$ReleaseTime)
+#combined$btime<-strptime(combined$BTime,"%Y-%m-%d %I:%M:%S %p")
+#combined<- combined %>% select(-btime)
+combined2<-combined %>% select(-BookedTime,-ReleaseTime,-Booked,-Btime,-Rtime)
+
+#top customers analysis, set adrnam to factor, with levels determined by frequency
+combined<-within(combined,ADRNAM <- factor(ADRNAM, levels=names(sort(table(ADRNAM), decreasing=FALSE))))
+addressnames<-combined%>%group_by(ADRNAM)%>%count(ADRNAM)%>%arrange(desc(n))
+
+
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+sameday<-combined %>% select(SHIP_ID,DropTime,lines,Day)
+sameday<-distinct(sameday)
+sameday<-sameday %>% group_by(DropTime,Day) %>% summarise(lines=sum(lines))
+total<-sameday %>% group_by(Day) %>% summarise(lines=sum(lines))
+total$dow<-weekdays(total$Day)
+
+
+```
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+dbtotal<-describeBy(total$lines, group=total$dow, mat=TRUE)
+dbtotal %>% select(group1,n,mean,sd,median,min,max,range,skew)
+```
+
+
+##Drop Composition
+
+An analysis of drop composition originally completed on data provided from October 6th through November 15th did not provide actionable insight. Nonetheless, here are my high level findings. I am not including time based breakdowns or relationships between customers and parts, since no significant relationship was found.
+
+### By Customer
+
+A large number of customers had orders placed that were deemed to be same day orders. `r nrow(addressnames)` unique addresses were identified, accounting for `r sum(addressnames$n)` orders. The top 2 customers combined account for `r addressnames %>% filter(addressnames$ADRNAM %in% addressnames$ADRNAM[1:2]) %>% summarise(sum(n))` orders(`r paste0(round(addressnames %>% filter(addressnames$ADRNAM %in% addressnames$ADRNAM[1:2]) %>% summarise((sum(n)/ sum(addressnames$n))*100),2),"%")` of same day orders). Most things follow an 80-20 rule, which in this case would imply 80% of orders should be accounted for by looking at the top 20% of customers. That does not apply. The top 20% would translate to the top `r round(nrow(addressnames)*.2,0)`  customers, but at that point, all customers have ordered 2 orders. The line from 3 orders to 2 orders is at the `r paste0(nrow(addressnames %>% filter(n >= 3)),"th")` customer. For that reason, I decided not to focus on customers for my analysis, since it would be an insignificant driver. Side note, in the summary, one thing I find particularly interesting that I didn't explicitly investigate was average sameday order drop time.It shows that the average hour that the orders drop is approximately the 1pm bucket, skewed towards 2pm. That's strictly based off the hour within which the order was dropped, and affected by the length of time the data is scattered accross. I would expect to see that central point move over the different time frames. We also see the average lines per order being `r round(mean(combined$lines),2)`, seemingly skewed by higher number orders, since the median (likely a more reliable central measure in this instance) is `r median(combined$lines)`. As expected, more total sameday lines drop on `r (combined %>% group_by(DOW) %>% summarise(lines=sum(lines)) %>% arrange(desc(lines)))[1,1]` than any other day (Mondays are slightly skewed due to holidays), having a total of `r (combined %>% group_by(DOW) %>% summarise(lines=sum(lines)) %>% arrange(desc(lines)))[1,2]` lines .
+
+###By Part
+
+
+```{r echo=FALSE, warning=FALSE,message=FALSE}
+samedayparts <- read_csv("~/R/OrderPatterns/samedayparts.csv", 
+    col_types = cols(BookedTime = col_character(), 
+        ReleaseTime = col_character()))
+samedayparts<-samedayparts %>% select(-X1,-LOTNUM,-lines)
+
+samedayparts$ADRNAM<-factor(samedayparts$ADRNAM)
+samedayparts$PRTNUM<-factor(samedayparts$PRTNUM)
+samedayparts$SHIP_ID<-factor(samedayparts$SHIP_ID)
+samedayparts$priority<-factor(samedayparts$priority)
+samedayparts$CARCOD<-factor(samedayparts$CARCOD)
+samedayparts$DOW<-factor(weekdays(samedayparts$Booked),day_levels)
+
+```
+
+```{r echo=FALSE, warning=FALSE,message=FALSE}
+summaryparts<-samedayparts %>% select(PRTNUM,ORDQTY,DOW,DropTime)
+summary(summaryparts)
+```
+
+
+
+```{r message= FALSE, echo= FALSE, warning =FALSE}
+samedayparts<-within(samedayparts,PRTNUM <- factor(PRTNUM, levels=names(sort(table(PRTNUM), decreasing=FALSE))))
+parts<-samedayparts%>%group_by(PRTNUM)%>%count(PRTNUM)%>%arrange(desc(n))
+top20p<-samedayparts %>% filter(PRTNUM %in% parts$PRTNUM[1:20])
+ggplot(subset(parts,PRTNUM %in% parts$PRTNUM[1:20]), aes(x=PRTNUM,y=n)) +geom_bar(stat="identity",fill="purple")+
+  coord_flip()+ theme_fivethirtyeight()+geom_text(aes(label=n), hjust=1, col="white", fontface= "bold")+ggtitle("Top Parts on Same Day Orders")
+```
+
+Looking at the top 20 parts, we see a lot of "consumables" for kits. This isn't too surprising and lines up pretty well with normal volumes. In a normal 60 day time frame, we ship ~6800 unique SKUs. In this sameday analysis, we see `r nrow(parts)` unique SKUs, with the top 20 accounting for `r sum(parts$n[1:20])`  lines out of `r sum(parts$n)` lines `r paste0((round(sum(parts$n[1:20])/sum(parts$n),3)*100),"%")`, which is much better than our customer percentage. 
+This information could provide actionable insight to use for slotting purposes, but as many as 3-4 lots of a part can be actively picked at any time, creating a major barrier to slotting. Without *Red Prairie* FEFO logic controlling lots and allocating 1 location at a time until picked completely clean, this information is not easily leveraged.
+
+To get an idea of parts driving afternoon orders specifically, we can subset based on the hour they were dropped.
+
+```{r message =FALSE, echo=FALSE, warning =FALSE}
+#parts driving afternoon orders?
+afternoonparts<- samedayparts %>% filter(DropTime>=13, DropTime<=15) 
+aftparts<-afternoonparts%>%group_by(PRTNUM)%>%count(PRTNUM)%>%arrange(desc(n))
+ggplot(aftparts[1:15,], aes(x=fct_reorder(PRTNUM,n),y=n)) +geom_bar(stat="identity",fill="purple")+
+  coord_flip()+ theme_fivethirtyeight()+geom_text(aes(label=n), hjust=1, col="white", fontface= "bold")+labs(x="Parts", y="Orders")+ggtitle("Top Parts on Same Day Afternoon Orders")
+
+
+```
+
+Not surprisingly, there's not too much of a change, the percentage only changes marginally to `r  paste0((round(sum(aftparts$n[1:20])/sum(aftparts$n),3)*100),"%")`.
+
+
+##Adding Data from 11-15 to 1-09
+
+After being provided additional Data, comparing total lines from 2016-10-06 to 2017-01-09.
+
+Would need data from 2016-09-12 through 2016-10-24 to clarify further. 
+```{R echo=FALSE,warning=FALSE, message=FALSE}
+#pull in entire new file
+samedaylines9_27to1_10 <- samedaylines9_27to1_10 <- read_csv("~/R/OrderPatterns/samedaylines9.27to1.10.csv", 
+                            col_types = cols(`Original Batch Completion Date` = col_date(format = "%m/%d/%Y"), 
+                                `Pick Release Date/Time` = col_date(format = "%m/%d/%Y"), 
+                                comptime = col_character(), reltime = col_character()))
+samedaynew<-samedaylines9_27to1_10
+
+#clean up: remove unneeded columns, rename columns to make easier to work with, split times from dates, format dates
+samedaynew<-samedaynew %>% rename(bdate=`Booked Date`,
+                                  btime=`Booked Date and Time`,
+                                  rdate=`Request Date`,
+                                  
+                                  delnum=`Delivery Number`,
+                                  priority=`Shipment Priority Code`,
+                                  
+                                  
+                                  dellines=`Count Delivery Lines`,
+                                  reldate=`Pick Release Date/Time`,
+                                  compdate=`Original Batch Completion Date`
+                                  )
+ 
+samedaynew<-samedaynew %>% separate(btime, c("btime2","btime3"),sep =" ",
+                                                                 convert = FALSE)%>% 
+                                select(-btime2) %>% rename(btime=btime3)
+
+samedaynew<-samedaynew %>% separate(reltime, c("reltime2","reltime3"),sep =" ",
+                                                                 convert = FALSE) %>% select(-reltime2) %>%                                                 rename(reltime=reltime3)
+
+samedaynew<-samedaynew %>% separate(comptime, c("comptime2","comptime3"),sep =" ",
+                                                                 convert = FALSE)%>% 
+                                 select(-comptime2) %>% rename(comptime=comptime3)
+samedaynew$rdate<-mdy(samedaynew$rdate)
+samedaynew$bdate<-mdy(samedaynew$bdate)
+
+samedaynew<-samedaynew %>% select(delnum,priority,dellines,bdate,btime,reldate,reltime,compdate,comptime,rdate)
+samedaynewfull<-samedaynew
+samedaynew<-samedaynew %>% filter(bdate==reldate & bdate==rdate)
+samedaynew<-samedaynew %>% rename(SHIP_ID=delnum)
+#whew! data cleaned and organized, now we can begin working with it
+#need to join order info from RP to find drop time
+#only need to pull data from 11-15 since data actually only contains raw data from 10.06 like original data provided
+
+dropdetail11_15to1_10 <- read_excel("~/R/OrderPatterns/dropdetail11.15to1.10.xlsx", 
+                                    col_types = c("text", "text", "text", 
+                                                  "text", "text", "text", "numeric"))
+newdrops<-dropdetail11_15to1_10
+newdrops$Day<-ymd(newdrops$Day)
+newdrops$DropTime<-factor(newdrops$DropTime)
+newdrops$dow<-factor(newdrops$dow)
+#sameday new=26363 rows, newdrops=18659 rows
+newcombined<-left_join(samedaynew,newdrops, by="SHIP_ID")
+#joined = 26380??? where did 17 additional rows come from?
+#Join original analysis? -------COME BACK TO THIS
+newcombined<- newcombined %>% filter(DropTime != "NA")
+#data is now 14,180 obs, lost ~4.5k rows from RP pull due to not being same day drop
+#remove duplicate lines
+newcombined<-newcombined %>% select(-1)
+newcombinedfiltered<-newcombined %>% distinct()
+hoursum<-newcombinedfiltered %>% group_by(Day,DropTime) %>% summarise(Lines=sum(lines))
+hoursum<-hoursum %>% filter(!DropTime %in% c("05","06","07"))
+timdata <- read_csv("~/R/OrderPatterns/timdata.csv", 
+     col_types = cols(Day = col_character(), 
+         X1 = col_skip()))
+timdata$Day<-ymd(timdata$Day)
+timdata$dow<-factor(timdata$dow,day_levels)
+timdata<-timdata %>% rename(timlines=Lines)
+
+
+```
+```{r message=FALSE, warning=FALSE, echo=FALSE, fig.height=6}
+ggplot(hoursum,aes(Day,DropTime, size=Lines, col=Lines))+geom_point()+scale_color_viridis()+theme_fivethirtyeight() + ggtitle("Lines Per Hour Dropped",subtitle="Nov 15 - Jan 10")
+
+daysum<-hoursum %>% group_by(Day) %>% summarise(RPlines=sum(Lines))
+daysum<-daysum %>% left_join(timdata,by="Day")
+daysum<-daysum  %>% select(-dow)
+compare<-compare %>% rename(RPlines=lines,timlines=Lines) %>% select(Day,RPlines,timlines)
+longsum<-union_all(compare,daysum)
+longsum<-longsum %>% filter(timlines!="NA")
+```
+ 
+ There does seem to be a growth in number of same day lines after the 3pm drop change, despite dips in overall volume. Without pulling additional data, this can be verified by looking at daily shipped line averages for October, November, and December. Those are as follows: 2074,2159,1987, respectively. Given the sharp fall off in daily volume for December, it would be expected that the trendline(blue) would show a noticeable dip in December, but it does not.Furthermore, the linear regression line shoes a noticeable increase despite impact of very low outliers around New Years.
+ 
+```{r message=FALSE, warning=FALSE,echo=FALSE}
+
+ggplot(longsum, aes(Day,RPlines))+geom_line(size=1)+geom_smooth(method="loess",se=FALSE)+theme_fivethirtyeight()+
+  geom_point(size=2,col="red")+ggtitle("Total Same Day Lines", subtitle="with linear trend and moving average")+geom_vline(xintercept= as.numeric(longsum$Day[12]))+geom_smooth(method="lm", se=FALSE, col="purple")
+  
+```
+
+
+##Lines 'Just Missed'
+
+To begin looking at what to expect with changes to the drops, we can begin by looking at orders booked between 3-4pm and 4-5pm that were not released or requested to ship that day. It appears that about 516 orders during this time show booked date= release date = request date, but not all have RUSH as priority. These have been removed and assumed to have been additional same day orders, dropped as express shipments.
+
+```{r echo=FALSE, message=FALSE, error=FALSE, fig.width=10}
+#begin to look at potential impact of 'just missed' orders
+justmissed<-samedaynewfull %>% filter(btime> "15:00" & btime<"18:00")
+justmissed<-justmissed %>% distinct()
+#justmissedgrouped<-justmissedgrouped %>% filter(bdate != reldate)
+#5163 rows
+#remove shipments that weren't released next day
+justmissedgrouped<-justmissed %>% mutate(dow=weekdays(bdate)) %>% 
+  mutate(diff=  round(difftime(reldate,bdate,units="days"), digits =0))
+justmissedgrouped<-justmissedgrouped %>% filter(diff <= 4)
+justmissedgrouped<-justmissedgrouped %>% mutate(yes=ifelse(diff == "1" & dow %in% c("Monday","Tuesday","Wednesday","Thursday"),1,
+                                                           ifelse(dow =="Friday" & diff =="3", 1,
+                                                                  ifelse(bdate=="2016-10-07" & diff =="4",1,
+                                                                         ifelse(bdate=="2016-12-30" & diff =="4",1,0)))))
+justmissedgrouped<-justmissedgrouped %>% mutate(diff2=  round(difftime(rdate,bdate,units="days"), digits =0))
+
+#add bucket column
+justmissedbuckets<-justmissedgrouped %>% separate(btime,into=c("bhour","bmin"), sep=":",convert=FALSE,remove=FALSE) %>%  arrange(diff,diff2)
+jmsubset<-justmissedbuckets %>% filter(diff==0,diff2==0)
+justmissedbuckets<- justmissedbuckets%>% filter(!delnum %in% jmsubset$delnum) %>% filter(bhour != "17")
+jmbgrouped<-justmissedbuckets  %>% group_by(bdate,bhour) %>% summarise(Lines=sum(dellines))
+ggplot(jmbgrouped,aes(bdate,Lines,group=bhour, fill=bhour))+geom_bar(position="dodge", stat="identity")+geom_vline(xintercept= as.numeric(jmbgrouped$bdate[28])-1)+theme_fivethirtyeight()+ggtitle("'Just Missed' lines by Hour")+scale_fill_manual(values=c("purple","turquoise"))
+```
+
+It appears that lines 'Just Missed' hasn't significantly shifted with the change from 1pm to 3pm, but it's hard to tell if this is an actual effect or not. It seems to be impacted significantly by noise related to monthly/quarterly behavior. This would suggest that the trend is somewhat stable over time, when looking in terms of weeks, or even months, but the variance is high, making it very hard to plan. this is confirmed by looking at total 'just missed' lines as well.
+
+```{r echo=FALSE, error=FALSE, message=FALSE, warning=FALSE}
+jmbgrouped %>% filter(bhour != "17") %>% group_by(bdate) %>% summarise(Lines=sum(Lines)) %>% 
+  ggplot(aes(bdate,Lines))+geom_point(col="turquoise",size=2)+geom_line(col="purple",size=1)+theme_fivethirtyeight()+ggtitle("Total 'Just Missed' Lines", subtitle="3-4pm & 4-5pm rolled up from Oct 6th to Jan 10th")+
+geom_vline(xintercept= as.numeric(jmbgrouped$bdate[28]))
+```
+
+If we dive into the effect that the change from 1pm to 3pm had, we see a clear drop off in 'Just Missed' lines from the 2pm hour, but interestingly, it seemed to have little impact to the 1pm hour. The data for 'Just Missed' from October 6- October 23 doesn't give use much more clarity, due to such a small sample size. To have a better understanding, older data, preferably as far back as mid August, would be needed.
+
+```{r echo=FALSE,error=FALSE,  message=FALSE, warning=FALSE}
+onetothree<-samedaynewfull %>% filter(bdate<="2016-11-15") %>% filter(btime<"15:00",btime>="13:00")%>% mutate(dow=weekdays(bdate)) %>% 
+  mutate(diff=  round(difftime(reldate,bdate,units="days"), digits =0)) %>%mutate(yes=ifelse(diff == "1" & dow %in% c("Monday","Tuesday","Wednesday","Thursday"),1,
+                                                           ifelse(dow =="Friday" & diff =="3", 1,
+                                                                  ifelse(bdate=="2016-10-07" & diff =="4",1,
+                                                                         ifelse(bdate=="2016-12-30" & diff =="4",1,0)))))%>% mutate(diff2=  round(difftime(rdate,bdate,units="days"), digits =0))
+otsubset<-onetothree %>% filter(diff==0,diff2==0)
+onetothree<- onetothree%>% filter(!delnum %in% otsubset$delnum) %>% filter(diff <= 4)
+onetothree<-onetothree%>% separate(btime,into=c("bhour","bmin"), sep=":",convert=FALSE,remove=FALSE) %>%  arrange(diff,diff2)
+
+ot<-onetothree %>% group_by(bdate,bhour) %>%summarise(Lines=sum(dellines))%>% mutate(splittime = ifelse(bdate < "2016-10-24","1","0"))
+change<-ot %>% filter(bhour =="14") %>% group_by(splittime) %>% summarise(avg=mean(Lines)) 
+  ggplot(ot,aes(bdate,Lines,group=bhour, fill=bhour))+geom_bar(position="dodge", stat="identity")+theme_fivethirtyeight()+ggtitle("'Just Missed' lines by Hour",subtitle="Looking at 1&2pm from Oct 6 to Nov 15th")+geom_vline(xintercept= as.numeric(ot$bdate[26]))+scale_fill_manual(values=c("purple","turquoise"))
+```
+
+One problem we encounter here is that there was no 1 hour step back, so we aren't entirely sure what the impact will be. However, I think it's important to note that there is not a complete lack of 2pm orders listed as 'just missed' and I believe the 1pm drops show similar behavior. It appears we should expect approximately `r paste0((round(((change %>% mutate(perc= sum(change$avg[1])/sum(change$avg[2])))[1,3]),3)*100),"%")` of orders to go on back order. This is problematic for projecting drops as it can result in a wide range of outcomes.
+
+
+Exploring hourly behavior further, and displaying variance.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+(jmdb<-describeBy(jmbgrouped$Lines, group=jmbgrouped$bhour, mat=TRUE)) %>% select(group1,n,mean,sd,median,max,range)
+
+```
+
+Extracting only days since the change to 3pm drops.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+threejmbg<-jmbgrouped %>% filter(bdate>="2016-10-24") %>% filter(bhour!="17")
+ggplot(threejmbg,aes(bhour,Lines, group=bhour))+geom_boxplot(col="purple", fill="turquoise")+ggtitle("Just Missed Since 3pm Change")+theme_fivethirtyeight()+stat_summary()
+```
+
+We can see that the distribution of 'just missed' lines in the 3-4pm block is higher on average than the 4-5pm block, suggesting that the 'just missed' lines and possible future same day lines taper towards the end of the day.
+
+Finally, looking at the effect of weekday on 'just missed' since the change to 3pm
+
+```{r echo=FALSE}
+dowjm<-threejmbg %>% mutate(dow= factor(weekdays(bdate),day_levels))
+dowjmt<-dowjm %>% group_by(dow,bdate) %>% summarise(total=sum(Lines))
+describeBy(dowjmt$total, group=dowjmt$dow,mat=TRUE) %>% select(group1,n,mean,sd,median,min,max,range)
+
+```
+```{r echo=FALSE, error=FALSE, warning = FALSE, message=FALSE}
+dowjms<-dowjm%>% group_by(dow,bhour) %>% summarise(Lines=mean(Lines))
+
+ggplot(dowjm,aes(dow,Lines,group=dow))+geom_boxplot(fill="turquoise",col="purple")+ggtitle("'Just Missed' Lines by Day of Week")+stat_summary()+theme_fivethirtyeight()
+
+
+```
+
+Interestingly, this shows a pattern consistent with what I would expect over the course of week given our inbound patterns. Our busiest inbound day is Monday, which coorelates to the above graph having a higher overall grouping than the rest of the week. Fridays tend to be slower, so not surprising that it not only has more variance, but that the variance is on the low side. Since businesses and employees tend to take it easy on Friday, it makes sense that Friday would display lower activity. Wednesday has an interesting tight upper grouping, suggesting little variance once above the median, but that it's very common to  be a larger drop. That trend shows more variation when broken hour by which hour.
+
+```{r echo=FALSE, error=FALSE, warning = FALSE, message=FALSE}
+ggplot(dowjm,aes(dow,Lines,group=dow))+geom_boxplot(fill="turquoise",col="purple")+ggtitle("'Just Missed' Lines by Day of Week")+stat_summary()+theme_fivethirtyeight()+facet_wrap(~bhour)
+```
+
+It appears much of the variation on Friday occurs in the 3-4pm timeframe, and drops off significantly in the 4-5pm time frme, which is what we expect.Wednesday is the largest point of concern however, since the mean/median drops are larger for the 4pm just missed group than the 3pm just missed group.
+
+**note:explore lag effect/auto correlation, explore day of the week (x)/hour(y)/lines(size) distribution, analyze data since 4pm change**
+
+#Projecting Future Changes Based on 'Just Missed'
+
+Building a random forest model to predict drops produced on average ~21 RMSE, meaning when the model was cross validated, it was off on average by about 21 lines, in either direction. The R squared was approximately .49, so the model could explain 49% of the variance using Day of the Week, Drop Time, and Previous Drop, which isn't ideal. However, multiple models consistently valued Drop Time as the most important variable, with Previous Drop coming in 2nd, and Day of Week last. This is not consistent with expectation, so I believe additional feature engineering needs to be done to get an accurate forecast. The main goal of using a random forest model at this point is to find what variables correlate strongest with drops.
+
+# Concerns 
+Going forward into a change to 4pm cutoff with goal of transitioning to 5pm cuttoff, I have concerns about how CSR behavior impacts order patterns as noted in the change from 1pm to 3pm.
+Additionally, there doesn't seem to be enough data before October 6th to draw conclusions about what impact there truly is by moving drops times, and there's absolutely no reference point for moving back only 1 hour. The variance and uncertainty we see in the changes certainly make it clear it will be nearly impossible to predict, making it very hard to plan labor. This will result in the need to overstaff, driving up labor costs significantly. As well, the noted change in previous day drops to same day drops shows that we could have issues where there simply isn't enough work for 1st shift to operate efficiently, then 2nd shift getting hit with disproportionate volumes. With some days having  150+ 'just missed' lines, there are also some conerns about absolute process capabilities, which need to be investigated.
+
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. 
